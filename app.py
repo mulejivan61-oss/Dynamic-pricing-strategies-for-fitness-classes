@@ -615,19 +615,19 @@ with tab4:
             pred_view["Row"] = np.arange(1, len(pred_view) + 1)
 
             fig_book = px.line(
-                pred_view.head(300),
+                pred_view.head(50),
                 x="Row",
                 y="ExpectedBookings",
-                title="Predicted Bookings — First 300 Uploaded Rows"
+                title="Predicted Bookings — First 50 Uploaded Rows"
             )
             fig_book.update_layout(xaxis_title="Uploaded Row", yaxis_title="Predicted Bookings")
             st.plotly_chart(fig_book, use_container_width=True)
 
             fig_rev = px.line(
-                pred_view.head(300),
+                pred_view.head(50),
                 x="Row",
                 y="ExpectedRevenue",
-                title="Expected Revenue — First 300 Uploaded Rows"
+                title="Expected Revenue — First 50 Uploaded Rows"
             )
             fig_rev.update_layout(xaxis_title="Uploaded Row", yaxis_title="Expected Revenue (INR)")
             st.plotly_chart(fig_rev, use_container_width=True)
