@@ -1,5 +1,4 @@
 
-
 """
 Fitness Class Dynamic Pricing & Demand Intelligence Dashboard
 Run: streamlit run app.py
@@ -25,6 +24,8 @@ import numpy as np
 import joblib
 import plotly.express as px
 import plotly.graph_objects as go
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
  
 st.set_page_config(page_title="Fitness Dynamic Pricing", layout="wide", page_icon="🏋️")
  
@@ -172,31 +173,25 @@ def predict_bookings(price, max_bookees, hour, timeslot, month, day, site, activ
  
  
 def find_optimal_price(max_bookees, hour, timeslot, month, day, site, activity,
-                        price_min=100, price_max=2000, step=10):
-    """Sweep all candidate prices through RF in one prediction call."""
-    prices = np.arange(price_min, price_max + step, step)
+                        base_price=499, adjustment_pct=0.05, step=5):
+    """RF demand/revenue optimization with a practical local price guardrail."""
+    base_price = float(base_price)
+    low = max(50, base_price * (1 - adjustment_pct))
+    high = base_price * (1 + adjustment_pct)
+    prices = np.arange(np.floor(low / step) * step, np.ceil(high / step) * step + step, step)
+    prices = np.unique(np.append(prices, base_price))
     candidates = pd.DataFrame({
-        "Price (INR)": prices,
-        "MaxBookees": max_bookees,
-        "Hour": hour,
-        "TimeSlot": timeslot,
-        "Month": month,
-        "Day": day,
-        "ActivitySiteID": site,
-        "ActivityDescription": activity,
+        "Price (INR)": prices, "MaxBookees": max_bookees, "Hour": hour,
+        "TimeSlot": timeslot, "Month": month, "Day": day,
+        "ActivitySiteID": site, "ActivityDescription": activity,
     })
     bookings = predict_bookings_batch(candidates)
     revenue = prices * bookings
-    curve = pd.DataFrame({
-        "Price": prices,
-        "PredictedBookings": bookings,
-        "Revenue": revenue
-    })
+    curve = pd.DataFrame({"Price": prices, "PredictedBookings": bookings, "Revenue": revenue})
     curve["Occupancy%"] = (curve["PredictedBookings"] / max_bookees) * 100
-    best_row = curve.loc[curve["Revenue"].idxmax()]
-    return curve, best_row
- 
- 
+    return curve, curve.loc[curve["Revenue"].idxmax()]
+
+
 def price_elasticity(curve, base_price):
     """Point elasticity of demand estimated straight from the RF model's own price sweep."""
     nearest = curve.iloc[(curve["Price"] - base_price).abs().argsort()[:2]].sort_values("Price")
@@ -213,6 +208,48 @@ def price_elasticity(curve, base_price):
     return pct_change_q / pct_change_p
  
  
+
+def recommendation_reason(base_price, best_price, base_pred, max_bookees, timeslot, day, site, activity, elasticity):
+    change = ((best_price - base_price) / base_price) * 100 if base_price else 0
+    occupancy = (base_pred / max_bookees) * 100 if max_bookees else 0
+    reasons = []
+    if occupancy >= 90:
+        reasons.append("high current occupancy")
+    elif occupancy < 40:
+        reasons.append("low current occupancy")
+    if elasticity is not None:
+        if elasticity < -1:
+            reasons.append("elastic demand")
+        elif elasticity > -0.2:
+            reasons.append("relatively inelastic demand")
+    if timeslot == "Morning": reasons.append("morning demand signal")
+    elif timeslot == "Evening": reasons.append("evening demand signal")
+    if day == "Tuesday": reasons.append("Tuesday demand signal")
+    if site in {"HXP", "BRP"}: reasons.append(f"strong site signal ({site})")
+    if activity in PREMIUM_HINT_CLASSES: reasons.append("historically high-demand class")
+    reasons_text = ", ".join(reasons[:3]) if reasons else "RF-predicted revenue response"
+    direction = "increase" if change > 0.05 else ("decrease" if change < -0.05 else "keep near current")
+    return f"Recommended to {direction} the price by {abs(change):.1f}% based on {reasons_text}."
+
+
+def recommendation_reason(base_price, best_price, base_pred, max_bookees, timeslot, day, site, activity, elasticity):
+    change = ((best_price - base_price) / base_price) * 100 if base_price else 0
+    occupancy = (base_pred / max_bookees) * 100 if max_bookees else 0
+    reasons = []
+    if occupancy >= 90: reasons.append("high current occupancy")
+    elif occupancy < 40: reasons.append("low current occupancy")
+    if elasticity is not None:
+        if elasticity < -1: reasons.append("elastic demand")
+        elif elasticity > -0.2: reasons.append("relatively inelastic demand")
+    if timeslot == "Morning": reasons.append("morning demand signal")
+    elif timeslot == "Evening": reasons.append("evening demand signal")
+    if day == "Tuesday": reasons.append("Tuesday demand signal")
+    if site in {"HXP", "BRP"}: reasons.append(f"strong site signal ({site})")
+    if activity in PREMIUM_HINT_CLASSES: reasons.append("historically high-demand class")
+    reasons_text = ", ".join(reasons[:3]) if reasons else "RF-predicted revenue response"
+    direction = "increase" if change > 0.05 else ("decrease" if change < -0.05 else "keep near current")
+    return f"Recommended to {direction} the price by {abs(change):.1f}% based on {reasons_text}."
+
 st.title("🏋️ Fitness Class Dynamic Pricing & Demand Intelligence")
 st.caption("ML-driven booking prediction, demand forecasting, and revenue-maximizing price optimization.")
  
@@ -307,7 +344,7 @@ with tab3:
         opt_activity = st.selectbox("Class", CLASSES, key="t3_activity")
         base_price = st.number_input("Current / base price (INR)", 50, 5000, 499, 10, key="t3_base")
  
-    price_range = st.slider("Price range to search (INR)", 50, 3000, (100, 1200), step=10)
+    adjustment_pct = st.slider("Maximum price adjustment", 1, 10, 5, step=1, format="%d%%") / 100
  
     if opt_activity in PREMIUM_HINT_CLASSES:
         st.caption("ℹ️ This class was historically identified as high-demand/premium in the EDA — "
@@ -315,7 +352,7 @@ with tab3:
  
     if st.button("Find Optimal Price", type="primary", key="t3_btn"):
         curve, best = find_optimal_price(opt_cap, opt_hour, opt_ts, opt_month, opt_day,
-                                          opt_site, opt_activity, price_range[0], price_range[1])
+                                          opt_site, opt_activity, base_price, adjustment_pct, 5)
         base_pred = predict_bookings(base_price, opt_cap, opt_hour, opt_ts, opt_month,
                                       opt_day, opt_site, opt_activity)
         base_revenue = base_price * base_pred
@@ -331,6 +368,12 @@ with tab3:
         if elasticity is not None:
             label = "Elastic — demand is price-sensitive" if abs(elasticity) > 1 else "Inelastic — demand is fairly price-stable"
             st.info(f"📐 Estimated price elasticity of demand near ₹{base_price}: **{elasticity:.2f}** — {label}")
+
+        st.success("💡 " + recommendation_reason(
+            base_price, best["Price"], base_pred, opt_cap, opt_ts, opt_day,
+            opt_site, opt_activity, elasticity
+        ))
+        st.caption(f"Guardrail: recommendation is limited to ±{adjustment_pct*100:.0f}% of the current price to avoid unrealistic extrapolation.")
  
         fig1 = px.line(curve, x="Price", y="PredictedBookings", title="Price vs Predicted Bookings (Demand Curve)")
         fig1.add_vline(x=best["Price"], line_dash="dash", line_color="green", annotation_text="Optimal")
@@ -391,19 +434,28 @@ with tab4:
 
                 # Same pricing logic as find_optimal_price, but all rows are
                 # evaluated together instead of using nested Python loops.
-                prices = np.arange(50, 2000 + 20, 20)
+                # Local 5% price guardrail, consistent with the project's controlled
+                # dynamic-pricing approach and the existing price sensitivity.
+                base_prices = batch["CurrentPrice"].to_numpy(dtype=float)
                 n_rows = len(batch)
-                n_prices = len(prices)
+                step = 5
+                low_prices = np.maximum(50, base_prices * 0.95)
+                high_prices = base_prices * 1.05
+                price_lists = [np.unique(np.append(
+                    np.arange(np.floor(lo / step) * step, np.ceil(hi / step) * step + step, step), bp
+                )) for lo, hi, bp in zip(low_prices, high_prices, base_prices)]
+                n_prices_per_row = np.array([len(x) for x in price_lists], dtype=int)
+                prices = np.concatenate(price_lists)
 
                 candidates = pd.DataFrame({
-                    "Price (INR)": np.tile(prices, n_rows),
-                    "MaxBookees": np.repeat(batch["MaxBookees"].to_numpy(), n_prices),
-                    "Hour": np.repeat(batch["Hour"].to_numpy(), n_prices),
-                    "TimeSlot": np.repeat(batch["TimeSlot"].to_numpy(), n_prices),
-                    "Month": np.repeat(batch["Month"].to_numpy(), n_prices),
-                    "Day": np.repeat(batch["Day"].to_numpy(), n_prices),
-                    "ActivitySiteID": np.repeat(batch["ActivitySiteID"].to_numpy(), n_prices),
-                    "ActivityDescription": np.repeat(batch["ActivityDescription"].to_numpy(), n_prices),
+                    "Price (INR)": prices,
+                    "MaxBookees": np.repeat(batch["MaxBookees"].to_numpy(), n_prices_per_row),
+                    "Hour": np.repeat(batch["Hour"].to_numpy(), n_prices_per_row),
+                    "TimeSlot": np.repeat(batch["TimeSlot"].to_numpy(), n_prices_per_row),
+                    "Month": np.repeat(batch["Month"].to_numpy(), n_prices_per_row),
+                    "Day": np.repeat(batch["Day"].to_numpy(), n_prices_per_row),
+                    "ActivitySiteID": np.repeat(batch["ActivitySiteID"].to_numpy(), n_prices_per_row),
+                    "ActivityDescription": np.repeat(batch["ActivityDescription"].to_numpy(), n_prices_per_row),
                 })
 
                 encoded = pd.get_dummies(
@@ -420,7 +472,7 @@ with tab4:
                 revenue = candidates["Price (INR)"].to_numpy() * predicted
 
                 candidate_results = pd.DataFrame({
-                    "RowID": np.repeat(np.arange(n_rows), n_prices),
+                    "RowID": np.repeat(np.arange(n_rows), n_prices_per_row),
                     "Price": candidates["Price (INR)"].to_numpy(),
                     "PredictedBookings": predicted,
                     "Revenue": revenue,
@@ -474,7 +526,7 @@ with tab4:
 
             st.caption(
                 "Pipeline: uploaded data → validation → vectorized Random Forest prediction "
-                "→ candidate-price sweep → revenue optimization."
+                "→ local ±5% candidate-price sweep → revenue optimization."
             )
 
             st.success(f"Optimized {len(result_df):,} rows.")
@@ -637,9 +689,8 @@ with st.expander("ℹ️ Methodology"):
     st.markdown("""
     - **Booking Predictor**: Random Forest regression trained on historical class booking data.
     - **Demand Forecast**: ARIMA time-series model on total daily bookings.
-    - **Optimal Price Finder**: sweeps price through the RF model to find where
-      `Price × Predicted Bookings` (revenue) is maximized, subject to capacity —
-      this *is* the dynamic pricing algorithm, driven by the model instead of fixed multipliers.
+    - **Optimal Price Finder**: performs a local candidate-price sweep around the current price,
+      using the RF model to maximize `Price × Predicted Bookings` while applying a ±5% practical price guardrail.
     - **Elasticity**: computed directly from the RF model's own demand response around the
       current price, rather than assumed from a rule table.
     - **Batch Optimizer**: applies the same optimization to many classes at once for
