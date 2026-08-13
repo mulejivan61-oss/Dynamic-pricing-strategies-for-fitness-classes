@@ -1,4 +1,5 @@
 
+
 """
 Fitness Class Dynamic Pricing & Demand Intelligence Dashboard
 Run: streamlit run app.py
@@ -50,7 +51,7 @@ RF_COLUMNS = list(rf_model.feature_names_in_)
  
 # Dropdown options (baseline categories are dropped in one-hot training, kept here so user can still pick them)
 TIMESLOTS = ["Afternoon", "Evening", "Morning"]
-MONTHS = ["April", "June", "May"]
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
 DAYS = ["Friday", "Monday", "Saturday", "Sunday", "Thursday", "Tuesday", "Wednesday"]
 SITES = ["BRP", "HXP", "NBL", "SBP", "TSC"]
 CLASSES = sorted(set(c.replace("ActivityDescription_", "")
@@ -81,18 +82,54 @@ def build_row(price, max_bookees, hour, timeslot, month, day, site, activity):
     return row_encoded.reindex(columns=RF_COLUMNS, fill_value=0)
  
  
+def predict_bookings_batch(rows):
+    """Predict many rows in ONE RF call instead of one call per row."""
+    if not isinstance(rows, pd.DataFrame):
+        rows = pd.DataFrame(rows)
+    encoded = pd.get_dummies(
+        rows,
+        columns=["TimeSlot", "Month", "Day", "ActivitySiteID", "ActivityDescription"]
+    ).reindex(columns=RF_COLUMNS, fill_value=0)
+    preds = np.asarray(rf_model.predict(encoded), dtype=float)
+    caps = rows["MaxBookees"].to_numpy(dtype=float)
+    return np.clip(preds, 0, caps)
+
+
 def predict_bookings(price, max_bookees, hour, timeslot, month, day, site, activity):
-    row_final = build_row(price, max_bookees, hour, timeslot, month, day, site, activity)
-    pred = rf_model.predict(row_final)[0]
-    return float(np.clip(pred, 0, max_bookees))
+    row = pd.DataFrame([{
+        "Price (INR)": price,
+        "MaxBookees": max_bookees,
+        "Hour": hour,
+        "TimeSlot": timeslot,
+        "Month": month,
+        "Day": day,
+        "ActivitySiteID": site,
+        "ActivityDescription": activity,
+    }])
+    return float(predict_bookings_batch(row)[0])
  
  
 def find_optimal_price(max_bookees, hour, timeslot, month, day, site, activity,
                         price_min=100, price_max=2000, step=10):
+    """Sweep all candidate prices through RF in one prediction call."""
     prices = np.arange(price_min, price_max + step, step)
-    bookings = [predict_bookings(p, max_bookees, hour, timeslot, month, day, site, activity) for p in prices]
-    revenue = prices * np.array(bookings)
-    curve = pd.DataFrame({"Price": prices, "PredictedBookings": bookings, "Revenue": revenue})
+    candidates = pd.DataFrame({
+        "Price (INR)": prices,
+        "MaxBookees": max_bookees,
+        "Hour": hour,
+        "TimeSlot": timeslot,
+        "Month": month,
+        "Day": day,
+        "ActivitySiteID": site,
+        "ActivityDescription": activity,
+    })
+    bookings = predict_bookings_batch(candidates)
+    revenue = prices * bookings
+    curve = pd.DataFrame({
+        "Price": prices,
+        "PredictedBookings": bookings,
+        "Revenue": revenue
+    })
     curve["Occupancy%"] = (curve["PredictedBookings"] / max_bookees) * 100
     best_row = curve.loc[curve["Revenue"].idxmax()]
     return curve, best_row
@@ -250,43 +287,140 @@ with tab4:
     st.subheader("Optimize Prices for Multiple Classes at Once")
     st.caption("Upload a CSV with columns: MaxBookees, Hour, TimeSlot, Month, Day, ActivitySiteID, "
                "ActivityDescription, CurrentPrice — get the recommended optimal price per row.")
- 
+
     template = pd.DataFrame([{
         "MaxBookees": 35, "Hour": 9, "TimeSlot": "Morning", "Month": "June",
         "Day": "Monday", "ActivitySiteID": "BRP", "ActivityDescription": CLASSES[0],
         "CurrentPrice": 499,
     }])
     st.download_button("Download CSV template", template.to_csv(index=False),
-                        "price_optimizer_template.csv", "text/csv")
- 
-    uploaded = st.file_uploader("Upload classes CSV", type="csv")
+                       "price_optimizer_template.csv", "text/csv")
+
+    uploaded = st.file_uploader(
+        "Upload classes CSV",
+        type="csv",
+        help="Use the provided template. Batch optimization is vectorized for large uploads."
+    )
+
     if uploaded is not None:
+        if uploaded.size > 10 * 1024 * 1024:
+            st.error("CSV is larger than 10 MB. Please upload a smaller file.")
+            st.stop()
+
         batch = pd.read_csv(uploaded)
-        results = []
-        with st.spinner("Optimizing prices for every row..."):
-            for _, r in batch.iterrows():
-                curve, best = find_optimal_price(
-                    r["MaxBookees"], r["Hour"], r["TimeSlot"], r["Month"], r["Day"],
-                    r["ActivitySiteID"], r["ActivityDescription"], 50, 2000, 20,
-                )
-                base_pred = predict_bookings(r["CurrentPrice"], r["MaxBookees"], r["Hour"],
-                                              r["TimeSlot"], r["Month"], r["Day"],
-                                              r["ActivitySiteID"], r["ActivityDescription"])
-                base_rev = r["CurrentPrice"] * base_pred
-                uplift = ((best["Revenue"] - base_rev) / base_rev * 100) if base_rev > 0 else 0
-                results.append({
-                    **r.to_dict(),
-                    "RecommendedPrice": round(best["Price"]),
-                    "ExpectedBookings": round(best["PredictedBookings"]),
-                    "ExpectedRevenue": round(best["Revenue"]),
-                    "RevenueUplift%": round(uplift, 1),
+
+        required_cols = {
+            "MaxBookees", "Hour", "TimeSlot", "Month", "Day",
+            "ActivitySiteID", "ActivityDescription", "CurrentPrice"
+        }
+        missing_cols = required_cols - set(batch.columns)
+
+        if missing_cols:
+            st.error("Missing required columns: " + ", ".join(sorted(missing_cols)))
+        elif batch.empty:
+            st.warning("The uploaded CSV is empty.")
+        else:
+            @st.cache_data(show_spinner=False)
+            def optimize_batch_cached(batch_csv, model_columns):
+                batch = pd.read_csv(pd.io.common.StringIO(batch_csv))
+
+                # Same pricing logic as find_optimal_price, but all rows are
+                # evaluated together instead of using nested Python loops.
+                prices = np.arange(50, 2000 + 20, 20)
+                n_rows = len(batch)
+                n_prices = len(prices)
+
+                candidates = pd.DataFrame({
+                    "Price (INR)": np.tile(prices, n_rows),
+                    "MaxBookees": np.repeat(batch["MaxBookees"].to_numpy(), n_prices),
+                    "Hour": np.repeat(batch["Hour"].to_numpy(), n_prices),
+                    "TimeSlot": np.repeat(batch["TimeSlot"].to_numpy(), n_prices),
+                    "Month": np.repeat(batch["Month"].to_numpy(), n_prices),
+                    "Day": np.repeat(batch["Day"].to_numpy(), n_prices),
+                    "ActivitySiteID": np.repeat(batch["ActivitySiteID"].to_numpy(), n_prices),
+                    "ActivityDescription": np.repeat(batch["ActivityDescription"].to_numpy(), n_prices),
                 })
-        result_df = pd.DataFrame(results)
-        st.dataframe(result_df, use_container_width=True, hide_index=True)
-        st.download_button("Download results CSV", result_df.to_csv(index=False),
-                            "optimized_prices.csv", "text/csv")
-        st.metric("Average Revenue Uplift Across Uploaded Classes", f"{result_df['RevenueUplift%'].mean():+.1f}%")
- 
+
+                encoded = pd.get_dummies(
+                    candidates,
+                    columns=["TimeSlot", "Month", "Day", "ActivitySiteID", "ActivityDescription"]
+                ).reindex(columns=list(model_columns), fill_value=0)
+
+                predicted = np.asarray(rf_model.predict(encoded), dtype=float)
+                predicted = np.clip(
+                    predicted,
+                    0,
+                    candidates["MaxBookees"].to_numpy(dtype=float)
+                )
+                revenue = candidates["Price (INR)"].to_numpy() * predicted
+
+                candidate_results = pd.DataFrame({
+                    "RowID": np.repeat(np.arange(n_rows), n_prices),
+                    "Price": candidates["Price (INR)"].to_numpy(),
+                    "PredictedBookings": predicted,
+                    "Revenue": revenue,
+                })
+
+                best_idx = candidate_results.groupby("RowID")["Revenue"].idxmax()
+                best = candidate_results.loc[best_idx].sort_values("RowID").reset_index(drop=True)
+
+                base_rows = batch.reset_index(drop=True).copy()
+                base_candidates = pd.DataFrame({
+                    "Price (INR)": base_rows["CurrentPrice"].to_numpy(),
+                    "MaxBookees": base_rows["MaxBookees"].to_numpy(),
+                    "Hour": base_rows["Hour"].to_numpy(),
+                    "TimeSlot": base_rows["TimeSlot"].to_numpy(),
+                    "Month": base_rows["Month"].to_numpy(),
+                    "Day": base_rows["Day"].to_numpy(),
+                    "ActivitySiteID": base_rows["ActivitySiteID"].to_numpy(),
+                    "ActivityDescription": base_rows["ActivityDescription"].to_numpy(),
+                })
+
+                base_encoded = pd.get_dummies(
+                    base_candidates,
+                    columns=["TimeSlot", "Month", "Day", "ActivitySiteID", "ActivityDescription"]
+                ).reindex(columns=list(model_columns), fill_value=0)
+
+                base_pred = np.asarray(rf_model.predict(base_encoded), dtype=float)
+                base_pred = np.clip(
+                    base_pred,
+                    0,
+                    base_rows["MaxBookees"].to_numpy(dtype=float)
+                )
+                base_rev = base_rows["CurrentPrice"].to_numpy(dtype=float) * base_pred
+
+                result_df = base_rows.copy()
+                result_df["RecommendedPrice"] = best["Price"].round().to_numpy()
+                result_df["ExpectedBookings"] = best["PredictedBookings"].round().to_numpy()
+                result_df["ExpectedRevenue"] = best["Revenue"].round().to_numpy()
+                result_df["RevenueUplift%"] = np.where(
+                    base_rev > 0,
+                    ((best["Revenue"].to_numpy() - base_rev) / base_rev) * 100,
+                    0
+                ).round(1)
+
+                return result_df
+
+            with st.spinner("Optimizing uploaded classes..."):
+                result_df = optimize_batch_cached(
+                    uploaded.getvalue().decode("utf-8"),
+                    tuple(RF_COLUMNS)
+                )
+
+            st.success(f"Optimized {len(result_df):,} rows.")
+            st.dataframe(result_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download results CSV",
+                result_df.to_csv(index=False),
+                "optimized_prices.csv",
+                "text/csv"
+            )
+            st.metric(
+                "Average Revenue Uplift Across Uploaded Classes",
+                f"{result_df['RevenueUplift%'].mean():+.1f}%"
+            )
+
+
 # ====================================================================
 # TAB 5: Model Insights — explainability + validation
 # ====================================================================
@@ -310,12 +444,12 @@ with tab5:
                      "ActivitySiteID", "ActivityDescription", "Number Booked"}
         if required.issubset(hist.columns):
             hist_sample = hist.sample(min(300, len(hist)), random_state=42)
-            preds = [predict_bookings(row["Price (INR)"], row["MaxBookees"], row["Hour"],
-                                       row["TimeSlot"], row["Month"], row["Day"],
-                                       row["ActivitySiteID"], row["ActivityDescription"])
-                     for _, row in hist_sample.iterrows()]
+            validation_rows = hist_sample[[
+                "Price (INR)", "MaxBookees", "Hour", "TimeSlot", "Month", "Day",
+                "ActivitySiteID", "ActivityDescription"
+            ]].copy()
+            preds = predict_bookings_batch(validation_rows)
             actual = hist_sample["Number Booked"].values.astype(float)
-            preds = np.array(preds)
             mae = np.mean(np.abs(preds - actual))
             rmse = np.sqrt(np.mean((preds - actual) ** 2))
             ss_res = np.sum((actual - preds) ** 2)
