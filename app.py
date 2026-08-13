@@ -95,6 +95,68 @@ def predict_bookings_batch(rows):
     return np.clip(preds, 0, caps)
 
 
+def show_dataset_health(df):
+    """Show lightweight data-quality diagnostics for the currently uploaded CSV."""
+    rows, cols = df.shape
+    missing = int(df.isna().sum().sum())
+    duplicates = int(df.duplicated().sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", f"{rows:,}")
+    c2.metric("Columns", f"{cols:,}")
+    c3.metric("Missing Cells", f"{missing:,}")
+    c4.metric("Duplicate Rows", f"{duplicates:,}")
+
+    if missing == 0 and duplicates == 0:
+        st.success("Dataset Health: Excellent — no missing cells or duplicate rows detected.")
+    elif missing == 0:
+        st.info(f"Dataset Health: Good — no missing cells; {duplicates:,} duplicate rows detected.")
+    else:
+        st.warning(f"Dataset Health: Review required — {missing:,} missing cells detected.")
+
+    # Keep this visual compact so a 1000+ row upload does not make the app heavy.
+    quality = pd.DataFrame({
+        "Column": df.columns,
+        "Missing": df.isna().sum().values,
+        "Unique": [df[c].nunique(dropna=True) for c in df.columns]
+    })
+    quality = quality[quality["Missing"] > 0].sort_values("Missing", ascending=False)
+
+    if not quality.empty:
+        st.dataframe(quality, use_container_width=True, hide_index=True)
+
+
+def evaluate_uploaded_data(df):
+    """Calculate live metrics only when the uploaded file has a real target."""
+    required = {
+        "Number Booked", "Price (INR)", "MaxBookees", "Hour", "TimeSlot",
+        "Month", "Day", "ActivitySiteID", "ActivityDescription"
+    }
+    if not required.issubset(df.columns):
+        return None
+
+    rows = df[[
+        "Price (INR)", "MaxBookees", "Hour", "TimeSlot", "Month", "Day",
+        "ActivitySiteID", "ActivityDescription"
+    ]].copy()
+    actual_series = pd.to_numeric(df["Number Booked"], errors="coerce")
+    valid = actual_series.notna()
+    rows = rows.loc[valid].reset_index(drop=True)
+    actual = actual_series.loc[valid].to_numpy(dtype=float)
+
+    if len(actual) < 2:
+        return None
+
+    predicted = predict_bookings_batch(rows)
+    return {
+        "r2": float(r2_score(actual, predicted)),
+        "rmse": float(np.sqrt(mean_squared_error(actual, predicted))),
+        "mae": float(mean_absolute_error(actual, predicted)),
+        "actual": actual,
+        "predicted": predicted,
+    }
+
+
 def predict_bookings(price, max_bookees, hour, timeslot, month, day, site, activity):
     row = pd.DataFrame([{
         "Price (INR)": price,
@@ -286,12 +348,12 @@ with tab3:
 with tab4:
     st.subheader("Optimize Prices for Multiple Classes at Once")
     st.caption("Upload a CSV with columns: MaxBookees, Hour, TimeSlot, Month, Day, ActivitySiteID, "
-               "ActivityDescription, CurrentPrice — get the recommended optimal price per row.")
+               "ActivityDescription, CurrentPrice. Add Number Booked to enable live model evaluation.")
 
     template = pd.DataFrame([{
         "MaxBookees": 35, "Hour": 9, "TimeSlot": "Morning", "Month": "June",
         "Day": "Monday", "ActivitySiteID": "BRP", "ActivityDescription": CLASSES[0],
-        "CurrentPrice": 499,
+        "CurrentPrice": 499, "Number Booked": 22,
     }])
     st.download_button("Download CSV template", template.to_csv(index=False),
                        "price_optimizer_template.csv", "text/csv")
@@ -308,6 +370,9 @@ with tab4:
             st.stop()
 
         batch = pd.read_csv(uploaded)
+
+        st.markdown("### Dataset Health")
+        show_dataset_health(batch)
 
         required_cols = {
             "MaxBookees", "Hour", "TimeSlot", "Month", "Day",
@@ -407,6 +472,11 @@ with tab4:
                     tuple(RF_COLUMNS)
                 )
 
+            st.caption(
+                "Pipeline: uploaded data → validation → vectorized Random Forest prediction "
+                "→ candidate-price sweep → revenue optimization."
+            )
+
             st.success(f"Optimized {len(result_df):,} rows.")
             st.dataframe(result_df, use_container_width=True, hide_index=True)
             st.download_button(
@@ -415,17 +485,107 @@ with tab4:
                 "optimized_prices.csv",
                 "text/csv"
             )
+
+            s1, s2, s3 = st.columns(3)
+            s1.metric(
+                "Avg Recommended Price",
+                f"₹{result_df['RecommendedPrice'].mean():,.0f}"
+            )
+            s2.metric(
+                "Avg Expected Bookings",
+                f"{result_df['ExpectedBookings'].mean():,.1f}"
+            )
+            s3.metric(
+                "Total Expected Revenue",
+                f"₹{result_df['ExpectedRevenue'].sum():,.0f}"
+            )
             st.metric(
                 "Average Revenue Uplift Across Uploaded Classes",
                 f"{result_df['RevenueUplift%'].mean():+.1f}%"
             )
+
+            # ------------------------------------------------------------
+            # LIVE EVALUATION: only possible when uploaded data has the
+            # real observed target "Number Booked".
+            # ------------------------------------------------------------
+            live_eval = evaluate_uploaded_data(batch)
+
+            if live_eval is not None:
+                st.markdown("### Live Evaluation on Uploaded Dataset")
+                st.caption(
+                    "These metrics are calculated from the uploaded rows, "
+                    "not from the original training baseline."
+                )
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("R²", f"{live_eval['r2']:.4f}")
+                m2.metric("RMSE", f"{live_eval['rmse']:.4f}")
+                m3.metric("MAE", f"{live_eval['mae']:.4f}")
+
+                live_plot = pd.DataFrame({
+                    "Actual": live_eval["actual"],
+                    "Predicted": live_eval["predicted"]
+                })
+
+                fig_live = px.scatter(
+                    live_plot,
+                    x="Actual",
+                    y="Predicted",
+                    title="Actual vs Predicted Bookings — Uploaded Dataset",
+                    opacity=0.65,
+                    trendline="ols"
+                )
+                min_v = float(min(live_plot["Actual"].min(), live_plot["Predicted"].min()))
+                max_v = float(max(live_plot["Actual"].max(), live_plot["Predicted"].max()))
+                fig_live.add_shape(
+                    type="line",
+                    x0=min_v, y0=min_v, x1=max_v, y1=max_v,
+                    line=dict(dash="dash")
+                )
+                fig_live.update_layout(
+                    xaxis_title="Actual Bookings",
+                    yaxis_title="Predicted Bookings"
+                )
+                st.plotly_chart(fig_live, use_container_width=True)
+
+            else:
+                st.info(
+                    "To update R², RMSE, MAE and Actual-vs-Predicted dynamically, "
+                    "the uploaded CSV must contain the real `Number Booked` column. "
+                    "The current 8-column optimizer file has no actual target, so "
+                    "the app correctly avoids showing a misleading score."
+                )
+
+            # Always update the uploaded-data prediction view, even when the
+            # real target is not available.
+            st.markdown("### Uploaded Dataset — Prediction View")
+            pred_view = result_df.copy()
+            pred_view["Row"] = np.arange(1, len(pred_view) + 1)
+
+            fig_book = px.line(
+                pred_view.head(300),
+                x="Row",
+                y="ExpectedBookings",
+                title="Predicted Bookings — First 300 Uploaded Rows"
+            )
+            fig_book.update_layout(xaxis_title="Uploaded Row", yaxis_title="Predicted Bookings")
+            st.plotly_chart(fig_book, use_container_width=True)
+
+            fig_rev = px.line(
+                pred_view.head(300),
+                x="Row",
+                y="ExpectedRevenue",
+                title="Expected Revenue — First 300 Uploaded Rows"
+            )
+            fig_rev.update_layout(xaxis_title="Uploaded Row", yaxis_title="Expected Revenue (INR)")
+            st.plotly_chart(fig_rev, use_container_width=True)
 
 
 # ====================================================================
 # TAB 5: Model Insights — explainability + validation
 # ====================================================================
 with tab5:
-    st.subheader("Model Explainability & Validation")
+    st.subheader("Model Explainability & Validation — Training Baseline")
  
     st.markdown("**Feature Importance (Random Forest)**")
     importances = pd.DataFrame({
